@@ -100,7 +100,7 @@ jobs:
         continue-on-error: true
 
       - name: Clean SARIF file (remove duplicate tags)
-        if: always()
+        if: always() && hashFiles('govulncheck-results.sarif') != ''
         run: |
           # Remove duplicate tags from SARIF rules to fix validation errors
           jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= unique' \
@@ -110,7 +110,8 @@ jobs:
 
       - name: Upload govulncheck results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: always() && hashFiles('govulncheck-results.sarif') != ''
+        continue-on-error: true
         with:
           sarif_file: govulncheck-results.sarif
           category: govulncheck
@@ -124,7 +125,7 @@ jobs:
         continue-on-error: true
 
       - name: Clean gosec SARIF file (remove duplicate tags)
-        if: always()
+        if: always() && hashFiles('gosec-results.sarif') != ''
         run: |
           # Remove duplicate tags from SARIF rules to fix validation errors
           jq '(.runs[]?.tool.driver.rules[]?.properties.tags) |= unique' \
@@ -134,7 +135,8 @@ jobs:
 
       - name: Upload gosec results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: always() && hashFiles('gosec-results.sarif') != ''
+        continue-on-error: true
         with:
           sarif_file: gosec-results.sarif
           category: gosec
@@ -254,7 +256,8 @@ jobs:
 
       - name: Upload Grype results to GitHub Security tab
         uses: github/codeql-action/upload-sarif@v4
-        if: always()
+        if: always() && hashFiles('grype-results.sarif') != ''
+        continue-on-error: true
         with:
           sarif_file: grype-results.sarif
           category: grype
@@ -274,6 +277,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: [test, lint, security-scan, codeql-analysis, sbom]
+    if: always() && needs.test.result == 'success' && needs.lint.result == 'success'
 
     steps:
       - name: Checkout code
