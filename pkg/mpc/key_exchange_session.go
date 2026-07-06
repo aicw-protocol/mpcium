@@ -152,6 +152,11 @@ func (s *ecdhSession) Close() error {
 }
 
 func (e *ecdhSession) BroadcastPublicKey() error {
+	// WatchPeersReady may call triggerECDH before Ready() has run ListenKeyExchange(),
+	// in which case ephemeral keys are not generated yet. Avoid a nil pointer on PublicKey.
+	if e.publicKey == nil {
+		return fmt.Errorf("ecdh: public key not ready (ListenKeyExchange not completed yet)")
+	}
 	publicKeyBytes := e.publicKey.Bytes()
 	msg := types.ECDHMessage{
 		From:      e.nodeID,

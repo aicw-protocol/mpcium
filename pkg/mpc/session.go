@@ -32,7 +32,8 @@ const (
 
 	// PeerReadyTimeout is the max time to wait for all peers to confirm
 	// their subscriptions are active before starting the protocol.
-	PeerReadyTimeout = 10 * time.Second
+	// 10s is often too tight on Windows / under load; keygen runs ECDSA+EDDSA barriers in parallel.
+	PeerReadyTimeout = 60 * time.Second
 	// PeerReadyPollInterval is how often to retry the readiness check.
 	PeerReadyPollInterval = 300 * time.Millisecond
 )

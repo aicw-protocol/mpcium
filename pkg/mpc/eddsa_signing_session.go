@@ -26,6 +26,7 @@ type eddsaSigningSession struct {
 	endCh               chan *common.SignatureData
 	data                *keygen.LocalPartySaveData
 	tx                  *big.Int
+	txRawBytes          []byte // Original message bytes for signature verification
 	txID                string
 	networkInternalCode string
 	derivationPath      []uint32
@@ -90,7 +91,7 @@ func newEDDSASigningSession(
 	}
 }
 
-func (s *eddsaSigningSession) Init(tx *big.Int) error {
+func (s *eddsaSigningSession) Init(tx *big.Int, rawBytes []byte) error {
 	logger.Infof("Initializing signing session with partyID: %s, peerIDs %s", s.selfPartyID, s.partyIDs)
 	ctx := tss.NewPeerContext(s.partyIDs)
 	params := tss.NewParameters(tss.Edwards(), ctx, s.selfPartyID, len(s.partyIDs), s.threshold)
@@ -148,6 +149,7 @@ func (s *eddsaSigningSession) Init(tx *big.Int) error {
 	s.data = &data
 	s.version = keyInfo.Version
 	s.tx = tx
+	s.txRawBytes = rawBytes
 	logger.Info("Initialized sigining session successfully!")
 	return nil
 }
@@ -175,7 +177,12 @@ func (s *eddsaSigningSession) Sign(onSuccess func(data []byte)) {
 				Y:     publicKey.Y(),
 			}
 
-			ok := edwards.Verify(&pk, s.tx.Bytes(), new(big.Int).SetBytes(sig.R), new(big.Int).SetBytes(sig.S))
+			// Use original raw bytes for verification to preserve leading zeros
+			verifyBytes := s.txRawBytes
+			if verifyBytes == nil {
+				verifyBytes = s.tx.Bytes()
+			}
+			ok := edwards.Verify(&pk, verifyBytes, new(big.Int).SetBytes(sig.R), new(big.Int).SetBytes(sig.S))
 			if !ok {
 				s.sendErr(errors.New("Failed to verify signature"))
 				return
@@ -232,6 +239,12 @@ func (s *eddsaSigningSession) Close() error {
 	if s.tx != nil {
 		s.tx.SetInt64(0)
 		s.tx = nil
+	}
+	if s.txRawBytes != nil {
+		for i := range s.txRawBytes {
+			s.txRawBytes[i] = 0
+		}
+		s.txRawBytes = nil
 	}
 
 	// Clear the derivation path

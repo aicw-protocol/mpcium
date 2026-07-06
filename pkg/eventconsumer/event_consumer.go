@@ -133,6 +133,15 @@ func (ec *eventConsumer) Run() {
 }
 
 func (ec *eventConsumer) handleKeyGenEvent(natMsg *nats.Msg) {
+	// AICW-FORK (DoS fix): if the identity store can self-check membership and
+	// this node is NOT a verified member, skip silently — do not participate and
+	// do not publish an error to the result topic (which could race and fail a
+	// healthy ceremony). Verified members are unaffected.
+	if checker, ok := ec.identityStore.(interface{ IsSelfMember() bool }); ok && !checker.IsSelfMember() {
+		logger.Warn("AICW-FORK: skipping keygen event; this node is not a verified member")
+		return
+	}
+
 	baseCtx, baseCancel := context.WithTimeout(context.Background(), KeyGenTimeOut)
 	defer baseCancel()
 
@@ -357,6 +366,15 @@ func (ec *eventConsumer) consumeKeyGenerationEvent() error {
 }
 
 func (ec *eventConsumer) handleSigningEvent(natMsg *nats.Msg) {
+	// AICW-FORK (DoS fix): same self-membership gate as handleKeyGenEvent. A
+	// non-member node (e.g. whitelisted with the wrong public key) must not join
+	// the signing ceremony nor publish an error result that could race and fail
+	// a healthy 3-party signing.
+	if checker, ok := ec.identityStore.(interface{ IsSelfMember() bool }); ok && !checker.IsSelfMember() {
+		logger.Warn("AICW-FORK: skipping signing event; this node is not a verified member")
+		return
+	}
+
 	raw := natMsg.Data
 	var msg types.SignTxMessage
 	err := json.Unmarshal(raw, &msg)
@@ -467,7 +485,8 @@ func (ec *eventConsumer) handleSigningEvent(natMsg *nats.Msg) {
 	}
 
 	txBigInt := new(big.Int).SetBytes(msg.Tx)
-	err = session.Init(txBigInt)
+	// Pass both big.Int and raw bytes - EdDSA needs raw bytes to preserve leading zeros
+	err = session.Init(txBigInt, msg.Tx)
 	if err != nil {
 		ec.handleSigningSessionError(
 			msg.WalletID,

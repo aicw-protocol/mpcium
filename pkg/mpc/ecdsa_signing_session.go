@@ -24,7 +24,7 @@ import (
 type SigningSession interface {
 	Session
 
-	Init(tx *big.Int) error
+	Init(tx *big.Int, rawBytes []byte) error
 	Sign(onSuccess func(data []byte))
 	// WaitForPeersReady verifies all peers have their subscriptions active
 	// before starting the protocol. Replaces the fragile warmup sleep.
@@ -109,7 +109,9 @@ func newECDSASigningSession(
 
 }
 
-func (s *ecdsaSigningSession) Init(tx *big.Int) error {
+func (s *ecdsaSigningSession) Init(tx *big.Int, rawBytes []byte) error {
+	// rawBytes is unused for ECDSA (only needed for EdDSA Solana signatures)
+	_ = rawBytes
 	logger.Infof("Initializing signing session with partyID: %s, peerIDs %s", s.selfPartyID, s.partyIDs)
 	ctx := tss.NewPeerContext(s.partyIDs)
 	params := tss.NewParameters(tss.S256(), ctx, s.selfPartyID, len(s.partyIDs), s.threshold)
