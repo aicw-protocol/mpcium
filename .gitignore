@@ -9,6 +9,12 @@ coverage.html
 node*/
 peers.json
 
+# Local runtime / build artifacts (never commit)
+*.exe
+*.exe~
+wallets.json
+bridge-secrets-db/
+
 # E2E test artifacts
 e2e/test_db/
 e2e/test_node*/
