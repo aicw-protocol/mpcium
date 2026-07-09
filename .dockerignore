@@ -1,0 +1,41 @@
+# Git
+.git/
+.gitignore
+
+# Local node runtime data (badger DBs, identities)
+node0/
+node1/
+node2/
+node*/
+db/
+tmp/
+bin/
+identity/
+**/backups/
+**/*.db
+**/badger/
+
+# E2E / test artifacts
+e2e/test_db/
+e2e/test_node*/
+e2e/logs/
+e2e/coverage.out
+e2e/coverage.html
+e2e/config.test.yaml
+
+# Build artifacts & secrets
+*.exe
+*.exe~
+coverage.out
+coverage.html
+event_initiator.*
+peers.json
+config.yaml
+.chain_code
+
+# Editor / OS
+.vscode/
+.vagrant/
+.idea/
+.DS_Store
+Thumbs.db

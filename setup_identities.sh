@@ -69,9 +69,9 @@ echo "📦 Distributing chain_code to node configs ..."
 for i in $(seq 0 $((NUM_NODES-1))); do
     if grep -q '^\s*chain_code:' "node$i/config.yaml"; then
         if [[ "${OSTYPE:-}" == darwin* ]]; then
-            sed -i '' -E "s|^([[:space:]]*chain_code:).*|\\1 \"$CC\"|" config.yaml
+            sed -i '' -E "s|^([[:space:]]*chain_code:).*|\\1 \"$CC\"|" "node$i/config.yaml"
         else
-            sed -i -E "s|^([[:space:]]*chain_code:).*|\1 \"$CC\"|" config.yaml
+            sed -i -E "s|^([[:space:]]*chain_code:).*|\1 \"$CC\"|" "node$i/config.yaml"
         fi
     else
         printf '\nchain_code: "%s"\n' "$CC" >> "node$i/config.yaml"

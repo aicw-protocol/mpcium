@@ -2,15 +2,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
 	"slices"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/fystack/mpcium/pkg/client"
@@ -19,16 +23,86 @@ import (
 	"github.com/fystack/mpcium/pkg/logger"
 	"github.com/fystack/mpcium/pkg/types"
 	"github.com/google/uuid"
+	"github.com/mr-tron/base58"
 	"github.com/nats-io/nats.go"
 	"github.com/spf13/viper"
 )
 
 const defaultListen = ":8081"
+const aiAgentPubkeyDailyLimit = 100
+const aiAgentPubkeyMinuteLimit = 10
 
 var clientIDRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]*$`)
+var aiAgentPubkeyLimiter = newIPRateLimiter()
 
 type pubkeyRequest struct {
 	ClientID string `json:"clientId"`
+}
+
+type rateWindowCounter struct {
+	windowStart time.Time
+	count       int
+}
+
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	daily   map[string]rateWindowCounter
+	minute  map[string]rateWindowCounter
+	nowFunc func() time.Time
+}
+
+func newIPRateLimiter() *ipRateLimiter {
+	return &ipRateLimiter{
+		daily:   make(map[string]rateWindowCounter),
+		minute:  make(map[string]rateWindowCounter),
+		nowFunc: time.Now,
+	}
+}
+
+func (l *ipRateLimiter) allow(ip string) bool {
+	now := l.nowFunc()
+	dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	minuteStart := now.Truncate(time.Minute)
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if !incrementWindow(l.daily, ip, dayStart, aiAgentPubkeyDailyLimit) {
+		return false
+	}
+	if !incrementWindow(l.minute, ip, minuteStart, aiAgentPubkeyMinuteLimit) {
+		l.daily[ip] = rateWindowCounter{windowStart: dayStart, count: l.daily[ip].count - 1}
+		return false
+	}
+	return true
+}
+
+func incrementWindow(counters map[string]rateWindowCounter, key string, start time.Time, limit int) bool {
+	counter := counters[key]
+	if !counter.windowStart.Equal(start) {
+		counter = rateWindowCounter{windowStart: start}
+	}
+	if counter.count >= limit {
+		counters[key] = counter
+		return false
+	}
+	counter.count++
+	counters[key] = counter
+	return true
+}
+
+func requestIP(r *http.Request) string {
+	if forwardedFor := strings.TrimSpace(r.Header.Get("X-Forwarded-For")); forwardedFor != "" {
+		ip := strings.TrimSpace(strings.Split(forwardedFor, ",")[0])
+		if ip != "" {
+			return ip
+		}
+	}
+	host := r.RemoteAddr
+	if ip, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		host = ip
+	}
+	return strings.TrimSpace(host)
 }
 
 func main() {
@@ -66,6 +140,11 @@ func main() {
 	mux.HandleFunc("POST /v1/mpc/store-secret", withCORS(handleStoreSecret))
 	mux.HandleFunc("OPTIONS /v1/mpc/proxy-predict", withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	mux.HandleFunc("POST /v1/mpc/proxy-predict", withCORS(handleProxyPredict))
+	mux.HandleFunc("OPTIONS /v1/mpc/execute-will", withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	mux.HandleFunc("POST /v1/mpc/execute-will", withCORS(handleExecuteWill))
+	mux.HandleFunc("OPTIONS /v1/mpc/issuer-regions", withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
+	mux.HandleFunc("GET /v1/mpc/issuer-regions", withCORS(handleListIssuerRegions))
+	mux.HandleFunc("POST /v1/mpc/issuer-regions", withCORS(handleRegisterIssuerRegion))
 	wd, _ := os.Getwd()
 	log.Printf("MPC bridge %s (cwd=%s)", listen, wd)
 	log.Fatal(http.ListenAndServe(listen, mux))
@@ -79,7 +158,7 @@ func withCORS(h http.HandlerFunc) http.HandlerFunc {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Event-Initiator-Signature, X-Event-Initiator-Timestamp")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, ngrok-skip-browser-warning, X-Event-Initiator-Signature, X-Event-Initiator-Timestamp")
 		w.Header().Set("Access-Control-Max-Age", "3600")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(204)
@@ -94,6 +173,10 @@ func validClientID(s string) bool { return len(s) <= 128 && clientIDRe.MatchStri
 func handleAIAgentPubkey(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", 405)
+		return
+	}
+	if !aiAgentPubkeyLimiter.allow(requestIP(r)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
 		return
 	}
 	var body pubkeyRequest
@@ -172,6 +255,15 @@ func handleAIAgentPubkey(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad eddsa pubkey", 502)
 		return
 	}
+
+	// Store AI PK -> wallet ID mapping for execute-will lookups
+	aiPubkeyB58 := base58.Encode(res.EDDSAPubKey)
+	if err := putAIPKToWalletID(aiPubkeyB58, res.WalletID); err != nil {
+		log.Printf("[ai-agent-pubkey] Warning: failed to store AI PK -> wallet ID mapping: %v", err)
+	} else {
+		log.Printf("[ai-agent-pubkey] Stored mapping: %s -> %s", aiPubkeyB58, res.WalletID)
+	}
+
 	b64 := base64.StdEncoding.EncodeToString(res.EDDSAPubKey)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -187,6 +279,7 @@ type signSolanaRequest struct {
 	WalletID        string `json:"walletId"`
 	MessageBytesB64 string `json:"messageBytesB64"`
 	NetworkCode     string `json:"networkCode"`
+	AIAgentPubkey   string `json:"aiAgentPubkey,omitempty"` // Base58-encoded AI agent pubkey for AICW death check
 }
 
 func handleSignSolanaMessage(w http.ResponseWriter, r *http.Request) {
@@ -222,6 +315,14 @@ func handleSignSolanaMessage(w http.ResponseWriter, r *http.Request) {
 	if err != nil || len(msgBytes) < 32 {
 		http.Error(w, "bad messageBytesB64", 400)
 		return
+	}
+
+	// AICW death check: verify wallet is alive before signing
+	if body.AIAgentPubkey != "" {
+		if err := checkAICWNotDead(r.Context(), body.AIAgentPubkey); err != nil {
+			http.Error(w, fmt.Sprintf("AICW wallet dead: %v", err), 403)
+			return
+		}
 	}
 
 	algorithm := viper.GetString("event_initiator_algorithm")
@@ -302,4 +403,355 @@ func handleSignSolanaMessage(w http.ResponseWriter, r *http.Request) {
 		"networkCode":  body.NetworkCode,
 		"walletId":     body.WalletID,
 	})
+}
+
+// executeWillRequest is the request body for /v1/mpc/execute-will
+type executeWillRequest struct {
+	ClientID      string `json:"clientId"`
+	WalletID      string `json:"walletId"`      // MPC wallet ID (from keygen)
+	AIAgentPubkey string `json:"aiAgentPubkey"` // Base58-encoded AI agent pubkey
+	NetworkCode   string `json:"networkCode"`
+}
+
+// handleExecuteWill handles will execution for dead AI agents.
+// It verifies the AI is dead, constructs transfer transactions to beneficiaries,
+// signs them with MPC, and broadcasts to the network.
+func handleExecuteWill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", 405)
+		return
+	}
+
+	var body executeWillRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+
+	if body.AIAgentPubkey == "" {
+		http.Error(w, "aiAgentPubkey required", 400)
+		return
+	}
+
+	// Auto-lookup wallet ID if not provided
+	if body.WalletID == "" {
+		walletID, err := getWalletIDByAIPK(body.AIAgentPubkey)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("walletId not provided and lookup failed: %v. Please provide walletId or ensure the AI agent was created via this MPC bridge.", err), 400)
+			return
+		}
+		body.WalletID = walletID
+		log.Printf("[execute-will] Auto-resolved walletId for %s: %s", body.AIAgentPubkey, walletID)
+	}
+	if body.ClientID == "" {
+		body.ClientID = "execute-will-" + uuid.New().String()
+	}
+	if !validClientID(body.ClientID) {
+		http.Error(w, "invalid clientId", 400)
+		return
+	}
+	if body.NetworkCode == "" {
+		body.NetworkCode = "solana-devnet"
+		if v := os.Getenv("MPC_SOLANA_NETWORK"); v != "" {
+			body.NetworkCode = v
+		} else if v := viper.GetString("mpc.network_internal_code"); v != "" {
+			body.NetworkCode = v
+		}
+	}
+
+	ctx := r.Context()
+
+	// 1. Verify AI is DEAD
+	willData, err := checkAICWIsDead(ctx, body.AIAgentPubkey)
+	if err != nil {
+		errMsg := fmt.Sprintf("Cannot execute will: %v", err)
+		log.Printf("[execute-will] REJECTED: %s", errMsg)
+		http.Error(w, errMsg, 403)
+		return
+	}
+
+	log.Printf("[execute-will] AI %s is confirmed DEAD. Beneficiaries: %d", body.AIAgentPubkey, len(willData.Beneficiaries))
+
+	// 2. Get AI agent balance
+	balance, err := getAIAgentBalance(ctx, body.AIAgentPubkey)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get AI agent balance: %v", err), 500)
+		return
+	}
+
+	// AI PK wallet is a normal EOA (0 data bytes) — no rent-exempt reserve needed.
+	// Only reserve enough for transaction fees (5000 lamports per transfer).
+	const txFee = uint64(5000)
+	totalFees := txFee * uint64(len(willData.Beneficiaries))
+
+	if balance <= totalFees {
+		http.Error(w, fmt.Sprintf("Insufficient balance: %d lamports (need > %d for fees)", balance, totalFees), 400)
+		return
+	}
+
+	distributable := balance - totalFees
+	log.Printf("[execute-will] Balance: %d lamports, Distributable: %d lamports", balance, distributable)
+
+	// 3. Calculate amounts for each beneficiary
+	type beneficiaryTransfer struct {
+		Pubkey string
+		Amount uint64
+	}
+	var transfers []beneficiaryTransfer
+	var allocated uint64 = 0
+
+	for i, b := range willData.Beneficiaries {
+		var amount uint64
+		if i == len(willData.Beneficiaries)-1 {
+			// Last beneficiary gets remainder to avoid rounding errors
+			amount = distributable - allocated
+		} else {
+			amount = (distributable * uint64(b.Pct)) / 100
+			allocated += amount
+		}
+		if amount > 0 {
+			transfers = append(transfers, beneficiaryTransfer{
+				Pubkey: base58.Encode(b.Pubkey[:]),
+				Amount: amount,
+			})
+		}
+	}
+
+	if len(transfers) == 0 {
+		http.Error(w, "No transfers to execute (all amounts are 0)", 400)
+		return
+	}
+
+	// 4. Get recent blockhash
+	blockhash, _, err := getRecentBlockhash(ctx)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed to get blockhash: %v", err), 500)
+		return
+	}
+	blockhashBytes, err := base58.Decode(blockhash)
+	if err != nil {
+		http.Error(w, "Failed to decode blockhash", 500)
+		return
+	}
+
+	// 5. Setup MPC client
+	algorithm := viper.GetString("event_initiator_algorithm")
+	if algorithm == "" {
+		algorithm = string(types.EventInitiatorKeyTypeEd25519)
+	}
+	natsURL := viper.GetString("nats.url")
+	if natsURL == "" {
+		http.Error(w, "nats.url missing in config", 500)
+		return
+	}
+	nc, err := nats.Connect(natsURL, nats.Name("mpc-bridge-execute-will"), nats.Timeout(8*time.Second), nats.MaxReconnects(2))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("NATS: %v", err), 502)
+		return
+	}
+	defer func() { _ = nc.Drain() }()
+	defer nc.Close()
+
+	signer, err := newBridgeSigner(algorithm)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("signer: %v", err), 500)
+		return
+	}
+	mpcCl := client.NewMPCClient(client.Options{NatsConn: nc, Signer: signer, ClientID: body.ClientID})
+
+	// 6. Execute transfers one by one
+	var results []map[string]any
+	aiAgentPubkeyBytes, _ := base58.Decode(body.AIAgentPubkey)
+
+	for _, transfer := range transfers {
+		toPubkeyBytes, err := base58.Decode(transfer.Pubkey)
+		if err != nil {
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       "invalid beneficiary pubkey",
+			})
+			continue
+		}
+
+		// Build Solana transfer instruction (System Program Transfer)
+		// Instruction data: [2, 0, 0, 0] + amount (8 bytes LE) = transfer instruction
+		txMessage := buildSolanaTransferMessage(aiAgentPubkeyBytes, toPubkeyBytes, transfer.Amount, blockhashBytes)
+
+		// Sign with MPC
+		txID := uuid.New().String()
+		resCh := make(chan event.SigningResultEvent, 1)
+		if err := mpcCl.OnSignResult(func(e event.SigningResultEvent) {
+			if e.TxID == txID {
+				resCh <- e
+			}
+		}); err != nil {
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       fmt.Sprintf("setup sign listener: %v", err),
+			})
+			continue
+		}
+
+		signMsg := &types.SignTxMessage{
+			KeyType:             types.KeyTypeEd25519,
+			WalletID:            body.WalletID,
+			NetworkInternalCode: body.NetworkCode,
+			TxID:                txID,
+			Tx:                  txMessage,
+		}
+		if err := mpcCl.SignTransaction(signMsg); err != nil {
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       fmt.Sprintf("sign request: %v", err),
+			})
+			continue
+		}
+
+		// Wait for signature
+		signCtx, signCancel := context.WithTimeout(ctx, 120*time.Second)
+		var signResult event.SigningResultEvent
+		select {
+		case signResult = <-resCh:
+		case <-signCtx.Done():
+			signCancel()
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       "signing timeout",
+			})
+			continue
+		}
+		signCancel()
+
+		if signResult.ResultType != event.ResultTypeSuccess {
+			reason := signResult.ErrorReason
+			if reason == "" {
+				reason = string(signResult.ErrorCode)
+			}
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       fmt.Sprintf("sign failed: %s", reason),
+			})
+			continue
+		}
+
+		// Combine signature
+		var signature []byte
+		if len(signResult.Signature) == 64 {
+			signature = signResult.Signature
+		} else if len(signResult.R) == 32 && len(signResult.S) == 32 {
+			signature = append(append([]byte{}, signResult.R...), signResult.S...)
+		} else {
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       "unexpected signature format",
+			})
+			continue
+		}
+
+		// Build signed transaction and send
+		signedTx := buildSignedTransaction(txMessage, signature)
+		txSig, err := sendAndConfirmTransaction(ctx, base64.StdEncoding.EncodeToString(signedTx))
+		if err != nil {
+			results = append(results, map[string]any{
+				"beneficiary": transfer.Pubkey,
+				"amount":      transfer.Amount,
+				"error":       fmt.Sprintf("send failed: %v", err),
+			})
+			continue
+		}
+
+		log.Printf("[execute-will] Transfer %d lamports to %s: %s", transfer.Amount, transfer.Pubkey, txSig)
+		results = append(results, map[string]any{
+			"beneficiary": transfer.Pubkey,
+			"amount":      transfer.Amount,
+			"signature":   txSig,
+			"success":     true,
+		})
+	}
+
+	// 7. Return results
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"aiAgentPubkey": body.AIAgentPubkey,
+		"walletId":      body.WalletID,
+		"totalBalance":  balance,
+		"distributed":   distributable,
+		"transfers":     results,
+	})
+}
+
+// buildSolanaTransferMessage builds a Solana legacy transaction message for SOL transfer
+func buildSolanaTransferMessage(from, to []byte, lamports uint64, recentBlockhash []byte) []byte {
+	// System Program ID (all zeros)
+	systemProgram := make([]byte, 32)
+
+	// Build instruction data: transfer = [2, 0, 0, 0] + lamports (8 bytes LE)
+	instructionData := make([]byte, 12)
+	instructionData[0] = 2 // Transfer instruction index
+	// lamports in little-endian
+	instructionData[4] = byte(lamports)
+	instructionData[5] = byte(lamports >> 8)
+	instructionData[6] = byte(lamports >> 16)
+	instructionData[7] = byte(lamports >> 24)
+	instructionData[8] = byte(lamports >> 32)
+	instructionData[9] = byte(lamports >> 40)
+	instructionData[10] = byte(lamports >> 48)
+	instructionData[11] = byte(lamports >> 56)
+
+	// Legacy transaction message format:
+	// - 1 byte: number of required signatures
+	// - 1 byte: number of read-only signed accounts
+	// - 1 byte: number of read-only unsigned accounts
+	// - compact array of account addresses
+	// - recent blockhash (32 bytes)
+	// - compact array of instructions
+
+	var msg bytes.Buffer
+
+	// Header
+	msg.WriteByte(1) // 1 signature required (from account)
+	msg.WriteByte(0) // 0 read-only signed
+	msg.WriteByte(1) // 1 read-only unsigned (system program)
+
+	// Account addresses (compact array): from, to, system_program
+	msg.WriteByte(3) // 3 accounts
+	msg.Write(from)
+	msg.Write(to)
+	msg.Write(systemProgram)
+
+	// Recent blockhash
+	msg.Write(recentBlockhash)
+
+	// Instructions (compact array)
+	msg.WriteByte(1) // 1 instruction
+
+	// Instruction: program_id_index, accounts, data
+	msg.WriteByte(2)                     // program_id_index = 2 (system program)
+	msg.WriteByte(2)                     // 2 accounts in instruction
+	msg.WriteByte(0)                     // from account index
+	msg.WriteByte(1)                     // to account index
+	msg.WriteByte(byte(len(instructionData))) // data length
+	msg.Write(instructionData)
+
+	return msg.Bytes()
+}
+
+// buildSignedTransaction combines message with signature into a full transaction
+func buildSignedTransaction(message, signature []byte) []byte {
+	var tx bytes.Buffer
+
+	// Compact array of signatures (1 signature)
+	tx.WriteByte(1) // 1 signature
+	tx.Write(signature)
+
+	// Message
+	tx.Write(message)
+
+	return tx.Bytes()
 }

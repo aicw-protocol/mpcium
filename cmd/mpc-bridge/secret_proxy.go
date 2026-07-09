@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -24,9 +25,11 @@ import (
 )
 
 const (
-	defaultPredictAPIBase       = "https://predict-seven.vercel.app"
+	defaultPredictAPIBase       = "https://predict-api-544f.onrender.com"
 	defaultSecretDBPath         = "./bridge-secrets-db"
 	secretKeyPrefix             = "predict_api_key:"
+	walletMappingPrefix         = "ai_pk_to_wallet_id:"
+	walletReverseMappingPrefix  = "wallet_id_to_ai_pk:"
 	headerEventSig              = "X-Event-Initiator-Signature"
 	headerEventTimestamp        = "X-Event-Initiator-Timestamp"
 	requestSkewSecondsTolerance = int64(300)
@@ -54,11 +57,12 @@ type storeSecretRequest struct {
 }
 
 type proxyPredictRequest struct {
-	MPCWalletID string          `json:"mpc_wallet_id"`
-	Method      string          `json:"method"`
-	Path        string          `json:"path"`
-	Query       string          `json:"query,omitempty"`
-	Body        json.RawMessage `json:"body,omitempty"`
+	MPCWalletID   string          `json:"mpc_wallet_id"`
+	AIAgentPubkey string          `json:"ai_agent_pubkey,omitempty"`
+	Method        string          `json:"method"`
+	Path          string          `json:"path"`
+	Query         string          `json:"query,omitempty"`
+	Body          json.RawMessage `json:"body,omitempty"`
 }
 
 func initBridgeSecretStore() error {
@@ -74,7 +78,10 @@ func initBridgeSecretStore() error {
 		path = defaultSecretDBPath
 	}
 	encKey := sha256.Sum256([]byte(rawSecret))
-	opts := badger.DefaultOptions(path).WithEncryptionKey(encKey[:]).WithSyncWrites(true)
+	opts := badger.DefaultOptions(path).
+		WithEncryptionKey(encKey[:]).
+		WithIndexCacheSize(64 << 20).
+		WithSyncWrites(true)
 	db, err := badger.Open(opts)
 	if err != nil {
 		return fmt.Errorf("open bridge secret db: %w", err)
@@ -122,6 +129,72 @@ func getPredictAPIKey(walletID string) (string, error) {
 	var out []byte
 	err := bridgeState.secretDB.View(func(txn *badger.Txn) error {
 		item, err := txn.Get(secretDBKey(walletID))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			out = append([]byte{}, v...)
+			return nil
+		})
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// walletMappingKey returns the DB key for AI PK -> wallet ID mapping
+func walletMappingKey(aiPubkeyB58 string) []byte {
+	return []byte(walletMappingPrefix + aiPubkeyB58)
+}
+
+// putAIPKToWalletID stores the bidirectional mapping between AI agent pubkey and MPC wallet ID
+func putAIPKToWalletID(aiPubkeyB58, walletID string) error {
+	if bridgeState.secretDB == nil {
+		return errors.New("secret db is not initialized")
+	}
+	return bridgeState.secretDB.Update(func(txn *badger.Txn) error {
+		if err := txn.Set(walletMappingKey(aiPubkeyB58), []byte(walletID)); err != nil {
+			return err
+		}
+		return txn.Set(walletReverseMappingKey(walletID), []byte(aiPubkeyB58))
+	})
+}
+
+func walletReverseMappingKey(walletID string) []byte {
+	return []byte(walletReverseMappingPrefix + walletID)
+}
+
+// getAIPKByWalletID retrieves the AI agent pubkey for a given MPC wallet ID
+func getAIPKByWalletID(walletID string) (string, error) {
+	if bridgeState.secretDB == nil {
+		return "", errors.New("secret db is not initialized")
+	}
+	var out []byte
+	err := bridgeState.secretDB.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(walletReverseMappingKey(walletID))
+		if err != nil {
+			return err
+		}
+		return item.Value(func(v []byte) error {
+			out = append([]byte{}, v...)
+			return nil
+		})
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// getWalletIDByAIPK retrieves the MPC wallet ID for a given AI agent pubkey
+func getWalletIDByAIPK(aiPubkeyB58 string) (string, error) {
+	if bridgeState.secretDB == nil {
+		return "", errors.New("secret db is not initialized")
+	}
+	var out []byte
+	err := bridgeState.secretDB.View(func(txn *badger.Txn) error {
+		item, err := txn.Get(walletMappingKey(aiPubkeyB58))
 		if err != nil {
 			return err
 		}
@@ -219,11 +292,28 @@ func readAndVerifySignedBody(w http.ResponseWriter, r *http.Request) ([]byte, bo
 		http.Error(w, "read body failed", http.StatusBadRequest)
 		return nil, false
 	}
+	// Local-only bypass: keep legacy OpenClaw flow working on same host.
+	if isLoopbackRequest(r) {
+		return body, true
+	}
 	if err := verifyEventInitiatorSignature(r, body); err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return nil, false
 	}
 	return body, true
+}
+
+func isLoopbackRequest(r *http.Request) bool {
+	host := strings.TrimSpace(r.RemoteAddr)
+	if host == "" {
+		return false
+	}
+	// RemoteAddr is usually "ip:port"
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 func handleStoreSecret(w http.ResponseWriter, r *http.Request) {
@@ -291,6 +381,21 @@ func handleProxyPredict(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(body.Path, "/api/v1/") {
 		http.Error(w, "path must start with /api/v1/", http.StatusBadRequest)
 		return
+	}
+
+	// AICW death check: resolve AI agent pubkey and verify wallet is alive
+	aiPubkey := strings.TrimSpace(body.AIAgentPubkey)
+	if aiPubkey == "" {
+		resolved, err := getAIPKByWalletID(body.MPCWalletID)
+		if err == nil && resolved != "" {
+			aiPubkey = resolved
+		}
+	}
+	if aiPubkey != "" {
+		if err := checkAICWNotDead(r.Context(), aiPubkey); err != nil {
+			http.Error(w, fmt.Sprintf("AICW wallet dead — proxy blocked: %v", err), http.StatusForbidden)
+			return
+		}
 	}
 
 	apiKey, err := getPredictAPIKey(body.MPCWalletID)
