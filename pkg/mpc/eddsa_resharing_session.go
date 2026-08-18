@@ -158,10 +158,14 @@ func (s *eddsaReshareSession) Reshare(done func()) {
 	for {
 		select {
 		case saveData := <-s.endCh:
-			if saveData.EDDSAPub != nil {
+			// Only new-committee peers persist v2 shares. Old-committee sessions
+			// participate in the TSS protocol but must not write Badger/Consul —
+			// their endCh payload is not a signing-capable new share and can
+			// overwrite the correct v2 written by the new-party session.
+			if s.isNewParty && saveData.EDDSAPub != nil {
 				defer security.ZeroEddsaKeygenLocalPartySaveData(saveData)
 
-					keyBytes, err := json.Marshal(saveData)
+				keyBytes, err := json.Marshal(saveData)
 				if err != nil {
 					s.ErrCh <- err
 					return
@@ -181,31 +185,25 @@ func (s *eddsaReshareSession) Reshare(done func()) {
 					Version:            newVersion,
 				}
 
-				// Save key info with resharing flag
 				if err := s.keyinfoStore.Save(s.composeKey(s.walletID), &keyInfo); err != nil {
 					s.ErrCh <- err
 					return
 				}
 
-				// skip for old committee
-				if saveData.EDDSAPub != nil {
-
-					// Get public key
-					publicKey := saveData.EDDSAPub
-					pkX, pkY := publicKey.X(), publicKey.Y()
-					pk := edwards.PublicKey{
-						Curve: tss.Edwards(),
-						X:     pkX,
-						Y:     pkY,
-					}
-
-					pubKeyBytes := pk.SerializeCompressed()
-					s.pubkeyBytes = pubKeyBytes
-
-					logger.Info("Generated public key bytes",
-						"walletID", s.walletID,
-						"pubKeyBytes", pubKeyBytes)
+				publicKey := saveData.EDDSAPub
+				pkX, pkY := publicKey.X(), publicKey.Y()
+				pk := edwards.PublicKey{
+					Curve: tss.Edwards(),
+					X:     pkX,
+					Y:     pkY,
 				}
+
+				pubKeyBytes := pk.SerializeCompressed()
+				s.pubkeyBytes = pubKeyBytes
+
+				logger.Info("Generated public key bytes",
+					"walletID", s.walletID,
+					"pubKeyBytes", pubKeyBytes)
 			}
 			done()
 			err := s.Close()

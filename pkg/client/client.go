@@ -23,6 +23,13 @@ type MPCClient interface {
 	OnSignResult(callback func(event event.SigningResultEvent)) error
 
 	Resharing(msg *types.ResharingMessage) error
+	// ResharingWithAuthorizers signs the message with the initiator key, then
+	// invokes collect() with the canonical authorizer bytes
+	// (types.ComposeAuthorizerRaw) so the caller can gather AuthorizerSignatures
+	// from an offline/separate service, attaches them, and publishes — without
+	// re-signing. Signing order matters: authorizers sign over the finalized
+	// initiator signature, so the message is signed exactly once here.
+	ResharingWithAuthorizers(msg *types.ResharingMessage, collect func(authorizerRaw []byte) ([]types.AuthorizerSignature, error)) error
 	OnResharingResult(callback func(event event.ResharingResultEvent)) error
 }
 
@@ -219,6 +226,48 @@ func (c *mpcClient) Resharing(msg *types.ResharingMessage) error {
 		return fmt.Errorf("Resharing: failed to sign message: %w", err)
 	}
 	msg.Signature = signature
+
+	bytes, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("Resharing: marshal error: %w", err)
+	}
+
+	if err := c.pubsub.Publish(eventconsumer.MPCReshareEvent, bytes, c.requestHeaders()); err != nil {
+		return fmt.Errorf("Resharing: publish error: %w", err)
+	}
+	return nil
+}
+
+// ResharingWithAuthorizers signs the message once with the initiator key, then
+// lets the caller collect authorizer signatures over the canonical authorizer
+// bytes before publishing. Unlike Resharing, it never re-signs after collecting,
+// so it is safe for non-deterministic initiator algorithms (e.g. P256) where a
+// second Sign() would invalidate the signature the authorizers signed over.
+func (c *mpcClient) ResharingWithAuthorizers(
+	msg *types.ResharingMessage,
+	collect func(authorizerRaw []byte) ([]types.AuthorizerSignature, error),
+) error {
+	raw, err := msg.Raw()
+	if err != nil {
+		return fmt.Errorf("Resharing: raw payload error: %w", err)
+	}
+	signature, err := c.signer.Sign(raw)
+	if err != nil {
+		return fmt.Errorf("Resharing: failed to sign message: %w", err)
+	}
+	msg.Signature = signature
+
+	if collect != nil {
+		authorizerRaw, err := types.ComposeAuthorizerRaw(msg)
+		if err != nil {
+			return fmt.Errorf("Resharing: compose authorizer raw error: %w", err)
+		}
+		sigs, err := collect(authorizerRaw)
+		if err != nil {
+			return fmt.Errorf("Resharing: collect authorizer signatures error: %w", err)
+		}
+		msg.AuthorizerSignatures = sigs
+	}
 
 	bytes, err := json.Marshal(msg)
 	if err != nil {

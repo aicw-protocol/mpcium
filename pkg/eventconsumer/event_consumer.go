@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"slices"
 	"sync"
 	"time"
 
@@ -28,6 +29,12 @@ const (
 	DefaultConcurrentKeygen  = 2
 	DefaultConcurrentSigning = 20
 	KeyGenTimeOut            = 30 * time.Second
+	// ReshareCeremonyTimeOut bounds the TSS rounds after the readiness barrier.
+	// tss-lib blocks indefinitely when a party stops sending, so without this the
+	// handler would hold the wallet's reshare slot for the lifetime of the process
+	// and every later attempt would be rejected as a duplicate. Must stay well
+	// below the orchestrator's result timeout so it sees a failure and can retry.
+	ReshareCeremonyTimeOut = 120 * time.Second
 )
 
 type EventConsumer interface {
@@ -166,6 +173,18 @@ func (ec *eventConsumer) handleKeyGenEvent(natMsg *nats.Msg) {
 	}
 
 	walletID := msg.WalletID
+
+	// AICW-FORK (auto_reshare_design.md §13.5): if committee filtering is active,
+	// only the wallet's committee members participate in the keygen. A ready node
+	// that is NOT in this wallet's committee must skip silently — creating a
+	// session with a party list that excludes self would break the ceremony.
+	// When committee filtering is disabled, KeygenParty returns all ready peers
+	// (self always included), so this never skips.
+	if party := ec.node.KeygenParty(walletID); len(party) > 0 && !slices.Contains(party, ec.node.ID()) {
+		logger.Info("AICW-FORK: skipping keygen; this node is not in the wallet committee",
+			"walletID", walletID, "committeeSize", len(party))
+		return
+	}
 
 	// Guard against duplicate keygen sessions for the same walletID.
 	// Under heavy load, the keygen consumer may NAK and JetStream redelivers,
@@ -619,7 +638,12 @@ func (ec *eventConsumer) sendReplyToRemoveMsg(natMsg *nats.Msg) {
 }
 
 func (ec *eventConsumer) consumeReshareEvent() error {
-	sub, err := ec.pubsub.Subscribe(MPCReshareEvent, func(natMsg *nats.Msg) {
+	// A reshare ceremony blocks for minutes. NATS delivers a subscription's
+	// messages on a single goroutine, so running it inline queues every other
+	// wallet behind it: by the time a queued event is picked up, the peers that
+	// started on time have already given up at the barrier and the whole
+	// committee reports "timeout waiting for peer <this node>".
+	handleReshare := func(natMsg *nats.Msg) {
 		var msg types.ResharingMessage
 		if err := json.Unmarshal(natMsg.Data, &msg); err != nil {
 			logger.Error("Failed to unmarshal resharing message", err)
@@ -662,6 +686,16 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 			return
 		}
 
+		// Reshare topics are keyed by walletID+keyType only, so two overlapping
+		// ceremonies for the same pair would share barrier and broadcast subjects.
+		reshareKey := fmt.Sprintf("reshare-%s", keyType)
+		if !ec.acquireReshareSlot(walletID, reshareKey) {
+			duplicateErr := fmt.Errorf("reshare already in progress for walletID=%s keyType=%s", walletID, keyType)
+			ec.handleReshareSessionError(msg.SessionID, walletID, keyType, msg.NewThreshold, duplicateErr, "Duplicate reshare session", natMsg)
+			return
+		}
+		defer ec.removeSession(walletID, reshareKey)
+
 		createSession := func(isNewPeer bool) (mpc.ReshareSession, error) {
 			return ec.node.CreateReshareSession(
 				sessionType,
@@ -693,6 +727,7 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 
 		ctx := context.Background()
 		var wg sync.WaitGroup
+		var cancelCeremony []func()
 
 		successEvent := &event.ResharingResultEvent{
 			WalletID:     walletID,
@@ -756,6 +791,7 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 
 		if oldSession != nil {
 			ctxOld, doneOld := context.WithCancel(ctx)
+			cancelCeremony = append(cancelCeremony, doneOld)
 			go oldSession.Reshare(doneOld)
 
 			wg.Go(func() {
@@ -775,6 +811,7 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 
 		if newSession != nil {
 			ctxNew, doneNew := context.WithCancel(ctx)
+			cancelCeremony = append(cancelCeremony, doneNew)
 			go newSession.Reshare(doneNew)
 			wg.Go(func() {
 				for {
@@ -792,7 +829,33 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 			})
 		}
 
-		wg.Wait()
+		ceremonyDone := make(chan struct{})
+		go func() {
+			wg.Wait()
+			close(ceremonyDone)
+		}()
+
+		select {
+		case <-ceremonyDone:
+		case <-time.After(ReshareCeremonyTimeOut):
+			for _, cancel := range cancelCeremony {
+				cancel()
+			}
+			if oldSession != nil {
+				if err := oldSession.Close(); err != nil {
+					logger.Error("Failed to close old reshare session", err, "walletID", walletID)
+				}
+			}
+			if newSession != nil {
+				if err := newSession.Close(); err != nil {
+					logger.Error("Failed to close new reshare session", err, "walletID", walletID)
+				}
+			}
+			timeoutErr := fmt.Errorf("reshare ceremony timed out after %v", ReshareCeremonyTimeOut)
+			ec.handleReshareSessionError(msg.SessionID, walletID, keyType, msg.NewThreshold, timeoutErr, "Reshare ceremony timed out", natMsg)
+			return
+		}
+
 		logger.Info("Reshare session finished", "walletID", walletID, "pubKey", fmt.Sprintf("%x", successEvent.PubKey))
 
 		if newSession != nil && len(successEvent.PubKey) > 0 {
@@ -819,6 +882,10 @@ func (ec *eventConsumer) consumeReshareEvent() error {
 		} else {
 			logger.Info("[COMPLETED RESHARE] Done (not a new party)", "walletID", walletID)
 		}
+	}
+
+	sub, err := ec.pubsub.Subscribe(MPCReshareEvent, func(natMsg *nats.Msg) {
+		go handleReshare(natMsg)
 	})
 
 	ec.reshareSub = sub
@@ -925,6 +992,34 @@ func (ec *eventConsumer) tryAddSession(walletID, txID string) bool {
 
 	ec.activeSessions[sessionID] = time.Now()
 	return true
+}
+
+// reshareSlotWait bounds how long a reshare request waits for an in-flight
+// ceremony on the same wallet+keyType to release its slot. The orchestrator
+// republishes the moment it sees a failure result, which lands while the failing
+// handler is still unwinding, so rejecting immediately would drop a valid retry.
+const reshareSlotWait = 15 * time.Second
+
+func (ec *eventConsumer) acquireReshareSlot(walletID, key string) bool {
+	sessionID := fmt.Sprintf("%s-%s", walletID, key)
+	deadline := time.Now().Add(reshareSlotWait)
+
+	for {
+		ec.sessionsLock.Lock()
+		_, exists := ec.activeSessions[sessionID]
+		if !exists {
+			ec.activeSessions[sessionID] = time.Now()
+		}
+		ec.sessionsLock.Unlock()
+
+		if !exists {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
 }
 
 // removeSession removes a session from the active sessions map so it can be retried.

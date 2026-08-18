@@ -3,7 +3,6 @@ package eventconsumer
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"time"
 
@@ -80,13 +79,22 @@ func (sc *keygenConsumer) waitForAllPeersReadyToGenKey(ctx context.Context) erro
 			}
 			return ctx.Err()
 		case <-ticker.C:
-			allPeersReady := sc.peerRegistry.ArePeersReady()
+			// AICW-FORK (§13.3): in committee-local mode the wallet's committee is
+			// not known until a request arrives, so the startup gate only requires
+			// a signing quorum (EnsureCeremonyReady(nil)) rather than the full mesh.
+			// In legacy mode this is exactly ArePeersReady().
+			var allPeersReady bool
+			if sc.peerRegistry.CeremonyFilterEnabled() {
+				allPeersReady = sc.peerRegistry.EnsureCeremonyReady(nil) == nil
+			} else {
+				allPeersReady = sc.peerRegistry.ArePeersReady()
+			}
 
 			if allPeersReady {
-				logger.Info("KeygenConsumer: All peers are ready, proceeding to consume messages")
+				logger.Info("KeygenConsumer: Peers ready, proceeding to consume messages")
 				return nil
 			} else {
-				logger.Info("KeygenConsumer: Waiting for all peers to be ready",
+				logger.Info("KeygenConsumer: Waiting for peers to be ready",
 					"readyPeers", sc.peerRegistry.GetReadyPeersCount(),
 					"totalPeers", sc.peerRegistry.GetTotalPeersCount())
 			}
@@ -142,9 +150,15 @@ func (sc *keygenConsumer) handleKeygenEvent(msg jetstream.Msg) {
 		return
 	}
 
-	if !sc.peerRegistry.ArePeersReady() {
-		logger.Warn("KeygenConsumer: Not all peers are ready to gen key, skipping message processing")
-		sc.handleKeygenError(keygenMsg, event.ErrorCodeClusterNotReady, errors.New("not all peers are ready"), sessionID, clientID)
+	// AICW-FORK (§13.3): gate on the wallet committee's ceremony readiness
+	// (committee-local ECDH). In legacy mode EnsureCeremonyReady falls back to
+	// the full-cluster ArePeersReady() check. A non-nil error maps to
+	// ERROR_CLUSTER_NOT_READY, which the Bridge surfaces as HTTP 503
+	// ecdh_not_ready (§13.3) instead of a generic TSS error.
+	party := sc.peerRegistry.GetKeygenParty(keygenMsg.WalletID)
+	if err := sc.peerRegistry.EnsureCeremonyReady(party); err != nil {
+		logger.Warn("KeygenConsumer: committee not ceremony-ready, skipping", "walletID", keygenMsg.WalletID, "error", err.Error())
+		sc.handleKeygenError(keygenMsg, event.ErrorCodeClusterNotReady, err, sessionID, clientID)
 		_ = msg.Ack()
 		return
 	}

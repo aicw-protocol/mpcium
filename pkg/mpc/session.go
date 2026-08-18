@@ -332,23 +332,24 @@ func (s *session) subscribeFromPeersAsync(fromIDs []string) {
 	}
 }
 
-func (s *session) subscribeBroadcastAsync() {
-	go func() {
-		topic := s.topicComposer.ComposeBroadcastTopic()
-		sub, err := s.pubSub.Subscribe(topic, func(natMsg *nats.Msg) {
-			s.receiveBroadcastTssMessage(natMsg.Data)
-		})
-		if err != nil {
-			s.sendErr(fmt.Errorf("Failed to subscribe to broadcast topic %s: %w", topic, err))
-			return
-		}
-		s.broadcastSub = sub
-	}()
+// subscribeBroadcast must complete before the readiness barrier releases:
+// broadcasts are fire-and-forget, so a round-1 message published while this
+// subscription is still pending is lost, and the party then waits forever.
+func (s *session) subscribeBroadcast() {
+	topic := s.topicComposer.ComposeBroadcastTopic()
+	sub, err := s.pubSub.Subscribe(topic, func(natMsg *nats.Msg) {
+		s.receiveBroadcastTssMessage(natMsg.Data)
+	})
+	if err != nil {
+		s.sendErr(fmt.Errorf("Failed to subscribe to broadcast topic %s: %w", topic, err))
+		return
+	}
+	s.broadcastSub = sub
 }
 
 func (s *session) ListenToIncomingMessageAsync() {
 	// 1) broadcast
-	s.subscribeBroadcastAsync()
+	s.subscribeBroadcast()
 
 	// 2) direct from peers in this session's partyIDs (includes self)
 	s.subscribeFromPeersAsync(partyIDsToNodeIDs(s.partyIDs))

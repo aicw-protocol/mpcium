@@ -145,6 +145,9 @@ func main() {
 	mux.HandleFunc("OPTIONS /v1/mpc/issuer-regions", withCORS(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) }))
 	mux.HandleFunc("GET /v1/mpc/issuer-regions", withCORS(handleListIssuerRegions))
 	mux.HandleFunc("POST /v1/mpc/issuer-regions", withCORS(handleRegisterIssuerRegion))
+	// Internal, operator-only manual reshare (§5.1 / §13.6). Not CORS-exposed;
+	// gated by bearer token and/or IP allowlist (see internalAuthOK).
+	mux.HandleFunc("POST /internal/reshare", handleInternalReshare)
 	wd, _ := os.Getwd()
 	log.Printf("MPC bridge %s (cwd=%s)", listen, wd)
 	log.Fatal(http.ListenAndServe(listen, mux))
@@ -247,6 +250,16 @@ func handleAIAgentPubkey(w http.ResponseWriter, r *http.Request) {
 		reason := res.ErrorReason
 		if reason == "" {
 			reason = string(res.ErrorCode)
+		}
+		// AICW-FORK (auto_reshare_design.md §13.3 / §1.7 AC): when the cluster or
+		// peers are not ready — which includes the committee-local ECDH exchange
+		// not yet being complete — return a distinct 503 ecdh_not_ready instead of
+		// a generic 502. This tells the client it is a transient "not ready yet"
+		// condition to retry, rather than a hard TSS failure.
+		switch res.ErrorCode {
+		case string(event.ErrorCodeClusterNotReady), string(event.ErrorCodePeerNotReady):
+			http.Error(w, "ecdh_not_ready", http.StatusServiceUnavailable)
+			return
 		}
 		http.Error(w, reason, 502)
 		return

@@ -17,9 +17,10 @@ func Init(env string, debug bool) {
 	}
 
 	zerolog.ErrorStackMarshaler = pkgerrors.MarshalStack
+	noColor := os.Getenv("NO_COLOR") != "" || os.Getenv("CLICOLOR") == "0"
 	if env != "production" {
 		Log = zerolog.New(
-			zerolog.ConsoleWriter{Out: os.Stderr, NoColor: false, TimeFormat: "2006-01-02 15:04:05.000"},
+			zerolog.ConsoleWriter{Out: os.Stderr, NoColor: noColor, TimeFormat: "2006-01-02 15:04:05.000"},
 		).With().Timestamp().Logger()
 	} else {
 		Log = zerolog.New(os.Stdout).With().Timestamp().Logger()

@@ -31,7 +31,26 @@ type PeerRegistry interface {
 	GetReadyPeersCount() int64
 	GetReadyPeersCountExcludeSelf() int64
 	GetReadyPeersIncludeSelf() []string // get ready peers include self
+	// GetKeygenParty returns the party (peer IDs including self) that should
+	// participate in a keygen for the given wallet. The default implementation
+	// returns GetReadyPeersIncludeSelf() (all ready peers). AICW's dynamic
+	// registry may override this to return a deterministic, tier-sized committee
+	// (auto_reshare_design.md §13.5) so large networks do not run O(N) keygen.
+	GetKeygenParty(walletID string) []string
 	GetTotalPeersCount() int64
+
+	// EnsureCeremonyReady is the committee-local ceremony gate
+	// (auto_reshare_design.md §13.3/§13.4). Implementations that support
+	// committee-local ECDH scope key exchange to the given committee and block
+	// until it is ceremony-ready or a timeout elapses. The default registry
+	// preserves the legacy full-cluster ArePeersReady() semantics.
+	EnsureCeremonyReady(committee []string) error
+	// EnsureCeremonyECDH scopes ECDH to a ceremony set and triggers exchange
+	// (best-effort, non-blocking). Default implementation is a no-op. §13.4.
+	EnsureCeremonyECDH(committee []string) error
+	// CeremonyFilterEnabled reports whether committee-local ceremony mode is on.
+	// Default implementation returns false. §13.5.
+	CeremonyFilterEnabled() bool
 
 	OnPeerConnected(callback func(peerID string))
 	OnPeerDisconnected(callback func(peerID string))
@@ -310,6 +329,35 @@ func (r *registry) GetReadyPeersIncludeSelf() []string {
 
 	peerIDs = append(peerIDs, r.nodeID) // append self
 	return peerIDs
+}
+
+// GetKeygenParty returns all ready peers including self. The original mpcium
+// registry does not implement committee filtering; AICW's DynamicRegistry
+// overrides this behavior.
+func (r *registry) GetKeygenParty(walletID string) []string {
+	return r.GetReadyPeersIncludeSelf()
+}
+
+// EnsureCeremonyReady preserves the legacy full-cluster gate. The original
+// mpcium registry has no committee-local ECDH; AICW's DynamicRegistry overrides
+// this. See auto_reshare_design.md §13.3.
+func (r *registry) EnsureCeremonyReady(committee []string) error {
+	if !r.ArePeersReady() {
+		return fmt.Errorf("not all peers are ready")
+	}
+	return nil
+}
+
+// EnsureCeremonyECDH is a no-op for the original registry (full-mesh ECDH).
+// AICW's DynamicRegistry overrides this. See §13.4.
+func (r *registry) EnsureCeremonyECDH(committee []string) error {
+	return nil
+}
+
+// CeremonyFilterEnabled reports that committee-local mode is off for the
+// original registry. AICW's DynamicRegistry overrides this. See §13.5.
+func (r *registry) CeremonyFilterEnabled() bool {
+	return false
 }
 
 func (r *registry) getReadyPeersFromKVStore(kvPairs api.KVPairs) []string {

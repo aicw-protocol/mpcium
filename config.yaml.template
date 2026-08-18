@@ -41,3 +41,21 @@ healthcheck:
 #    authorizer2:
 #      public_key: "33d5b5b3973c9bd46d782bc5488ea1840188234b0cbed66153b691caafe85385"
 #      algorithm: "ed25519"
+
+# Manual reshare endpoint (POST /internal/reshare) — internal, not CORS-exposed.
+# When `authorization.required_authorizers` is enabled network-wide, the manual
+# reshare must ALSO attach authorizer signatures or nodes reject it. Configure
+# the authorizers the Bridge should collect from (mirrors the orchestrator).
+bridge:
+  internal_allow_ips: ["127.0.0.1"]
+#   authorizers:
+#     request_timeout_seconds: 10
+#     list:
+#       - id: authorizer1
+#         mode: local            # local key file on the bridge host
+#         key_path: /secrets/authorizer1.authorizer.key
+#         algorithm: ed25519
+#       - id: authorizer2
+#         mode: remote           # offline/HSM signing service
+#         url: https://authorizer2.internal/sign
+#         token_env: AUTHORIZER2_TOKEN

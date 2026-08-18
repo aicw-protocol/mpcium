@@ -78,14 +78,27 @@ func (p *Node) ID() string {
 	return p.nodeID
 }
 
+// KeygenParty returns the committee (peer IDs including self) that will run the
+// keygen for walletID. Used by the event consumer to skip nodes that are not
+// part of a wallet's committee. AICW-FORK (auto_reshare_design.md §13.5).
+func (p *Node) KeygenParty(walletID string) []string {
+	return p.peerRegistry.GetKeygenParty(walletID)
+}
+
 func (p *Node) CreateKeyGenSession(
 	sessionType SessionType,
 	walletID string,
 	threshold int,
 	resultQueue messaging.MessageQueue,
 ) (KeyGenSession, error) {
-	if !p.peerRegistry.ArePeersReady() {
-		return nil, errors.New("All nodes are not ready!")
+	// AICW-FORK (§13.3/§13.4): committee-local ECDH gate. In legacy mode
+	// EnsureCeremonyReady falls back to the full-cluster ArePeersReady() check,
+	// so behavior is unchanged unless committee filtering is enabled. In
+	// committee mode it scopes/triggers ECDH for the wallet's committee and
+	// blocks until that committee is ceremony-ready (Consul-ready + ECDH keys).
+	party := p.peerRegistry.GetKeygenParty(walletID)
+	if err := p.peerRegistry.EnsureCeremonyReady(party); err != nil {
+		return nil, fmt.Errorf("keygen ceremony not ready: %w", err)
 	}
 
 	keyInfo, _ := p.getKeyInfo(sessionType, walletID)
@@ -104,7 +117,11 @@ func (p *Node) CreateKeyGenSession(
 }
 
 func (p *Node) createECDSAKeyGenSession(walletID string, threshold int, version int, resultQueue messaging.MessageQueue) (KeyGenSession, error) {
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
+	// AICW-FORK (auto_reshare_design.md §13.5): the keygen party is the wallet's
+	// committee (deterministic, tier-sized), not necessarily every ready peer.
+	// The default registry returns all ready peers, so behavior is unchanged
+	// unless AICW committee filtering is enabled.
+	readyPeerIDs := p.peerRegistry.GetKeygenParty(walletID)
 	selfPartyID, allPartyIDs := p.generatePartyIDs(PurposeKeygen, readyPeerIDs, version)
 	session := newECDSAKeygenSession(
 		walletID,
@@ -124,7 +141,8 @@ func (p *Node) createECDSAKeyGenSession(walletID string, threshold int, version 
 }
 
 func (p *Node) createEDDSAKeyGenSession(walletID string, threshold int, version int, resultQueue messaging.MessageQueue) (KeyGenSession, error) {
-	readyPeerIDs := p.peerRegistry.GetReadyPeersIncludeSelf()
+	// AICW-FORK (§13.5): keygen party = wallet committee (see ECDSA variant).
+	readyPeerIDs := p.peerRegistry.GetKeygenParty(walletID)
 	selfPartyID, allPartyIDs := p.generatePartyIDs(PurposeKeygen, readyPeerIDs, version)
 	session := newEDDSAKeygenSession(
 		walletID,
@@ -156,6 +174,17 @@ func (p *Node) CreateSigningSession(
 	keyInfo, err := p.getKeyInfo(sessionType, walletID)
 	if err != nil {
 		return nil, err
+	}
+
+	// AICW-FORK (§13.4): committee-local ECDH for signing. The signing committee
+	// is keyInfo.ParticipantPeerIDs; ensure symmetric keys with those members are
+	// (re)established — important after a node restart where the pairwise ECDH
+	// state was lost. Best-effort (no-op in legacy mode); the session barrier
+	// (WaitForPeersReady) provides the hard synchronization.
+	if p.peerRegistry.CeremonyFilterEnabled() {
+		if err := p.peerRegistry.EnsureCeremonyECDH(keyInfo.ParticipantPeerIDs); err != nil {
+			logger.Warn("Signing: ensure committee ECDH failed (continuing)", "walletID", walletID, "error", err.Error())
+		}
 	}
 
 	readyPeers := p.peerRegistry.GetReadyPeersIncludeSelf()
@@ -226,6 +255,21 @@ func (p *Node) CreateSigningSession(
 	}
 
 	return nil, errors.New("unknown session type")
+}
+
+// unionStrings returns the de-duplicated union of two string slices, preserving
+// first-seen order. AICW-FORK helper for the reshare committee ECDH set (§13.4).
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, s := range append(append([]string{}, a...), b...) {
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
 }
 
 func (p *Node) getKeyInfo(sessionType SessionType, walletID string) (*keyinfo.KeyInfo, error) {
@@ -317,6 +361,18 @@ func (p *Node) CreateReshareSession(
 		return nil, nil
 	}
 
+	// AICW-FORK (§13.4): committee-local ECDH for reshare. TSS resharing
+	// exchanges messages across the old ∪ new committees, so scope/trigger ECDH
+	// over that union to establish symmetric keys before the ceremony. This is
+	// best-effort (no-op in legacy mode); the reshare barrier and orchestrator
+	// retries provide the hard synchronization.
+	if p.peerRegistry.CeremonyFilterEnabled() {
+		ceremony := unionStrings(oldKeyInfo.ParticipantPeerIDs, newPeerIDs)
+		if err := p.peerRegistry.EnsureCeremonyECDH(ceremony); err != nil {
+			logger.Warn("Reshare: ensure committee ECDH failed (continuing)", "walletID", walletID, "error", err.Error())
+		}
+	}
+
 	logger.Info("Creating resharing session",
 		"type", sessionType,
 		"readyPeers", readyPeers,
@@ -360,9 +416,8 @@ func (p *Node) CreateReshareSession(
 			// Alternate pre-params for new nodes based on version: v1->1, v2->0, v3->1...
 			preParams = p.ecdsaPreParams[version%2]
 			participantPeerIDs = newPeerIDs
-		} else {
-			participantPeerIDs = oldKeyInfo.ParticipantPeerIDs
 		}
+		// Old committee: participantPeerIDs stays readyOldParticipantIDs (set above).
 
 		return NewECDSAReshareSession(
 			walletID,

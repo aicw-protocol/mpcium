@@ -25,6 +25,7 @@ type ReshareSession interface {
 	GetLegacyCommitteePeers() []string
 	WaitForPeersReady() error
 	Stop()
+	Close() error
 }
 
 type ecdsaReshareSession struct {
@@ -173,8 +174,8 @@ func (s *ecdsaReshareSession) Reshare(done func()) {
 	for {
 		select {
 		case saveData := <-s.endCh:
-			// skip for old committee
-			if saveData.ECDSAPub != nil {
+			// Only new-committee peers persist v2 shares (see eddsa variant).
+			if s.isNewParty && saveData.ECDSAPub != nil {
 
 				defer security.ZeroEcdsaKeygenLocalPartySaveData(saveData)
 
@@ -198,12 +199,10 @@ func (s *ecdsaReshareSession) Reshare(done func()) {
 					Version:            newVersion,
 				}
 
-				// Save key info with resharing flag
 				if err := s.keyinfoStore.Save(s.composeKey(s.walletID), &keyInfo); err != nil {
 					s.ErrCh <- err
 					return
 				}
-				// Get public key
 				publicKey := saveData.ECDSAPub
 				pubKey := &ecdsa.PublicKey{
 					Curve: publicKey.Curve(),
