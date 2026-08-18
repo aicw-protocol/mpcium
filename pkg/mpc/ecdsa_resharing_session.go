@@ -203,6 +203,7 @@ func (s *ecdsaReshareSession) Reshare(done func()) {
 					s.ErrCh <- err
 					return
 				}
+				s.deleteOldShareData(s.walletID, s.GetVersion())
 				publicKey := saveData.ECDSAPub
 				pubKey := &ecdsa.PublicKey{
 					Curve: publicKey.Curve(),

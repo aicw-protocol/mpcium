@@ -492,6 +492,28 @@ func walletIDWithVersion(walletID string, version int) string {
 	return walletID
 }
 
+// deleteOldShareData removes the pre-reshare share versions from the local
+// kvstore after the new share and keyinfo have been durably saved.
+// Rollback-attack mitigation (production-gaps-review.md G-1): retained
+// committee members must not keep version N-1 shares once version N is live.
+// Removed/offline nodes cannot delete their copies — with spare ≤ t this
+// still leaves attackers < t+1 old shares.
+func (s *session) deleteOldShareData(walletID string, oldVersion int) {
+	if oldVersion > 0 {
+		key := s.composeKey(walletIDWithVersion(walletID, oldVersion))
+		if err := s.kvstore.Delete(key); err != nil {
+			logger.Warn("Failed to delete old reshare share",
+				"walletID", walletID, "oldVersion", oldVersion, "key", key, "error", err.Error())
+		}
+	}
+	legacyKey := s.composeKey(walletID)
+	if err := s.kvstore.Delete(legacyKey); err != nil {
+		logger.Warn("Failed to delete legacy reshare share",
+			"walletID", walletID, "oldVersion", oldVersion, "key", legacyKey, "error", err.Error())
+	}
+	logger.Info("Old reshare share deleted", "walletID", walletID, "oldVersion", oldVersion)
+}
+
 func extractSenderIDFromDirectTopic(topic string) string {
 	// E.g: keygen:direct:ecdsa:<fromID>:<toID>:<walletID>
 	parts := strings.SplitN(topic, ":", 5)

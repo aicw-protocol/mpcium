@@ -189,6 +189,7 @@ func (s *eddsaReshareSession) Reshare(done func()) {
 					s.ErrCh <- err
 					return
 				}
+				s.deleteOldShareData(s.walletID, s.GetVersion())
 
 				publicKey := saveData.EDDSAPub
 				pkX, pkY := publicKey.X(), publicKey.Y()
