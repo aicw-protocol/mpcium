@@ -27,6 +27,13 @@ const (
 
 type ID string
 
+// AICW-FORK (production-gaps-review.md G-5): reject signing while an
+// orchestrator-driven reshare is in flight for the wallet. Nil checker
+// (upstream / orchestrator-less deployments) disables the guard.
+type ReshareInflightChecker func(walletID string) (bool, error)
+
+var ErrReshareInProgress = errors.New("reshare in progress for this wallet; retry after it completes")
+
 type Node struct {
 	nodeID  string
 	peerIDs []string
@@ -39,6 +46,8 @@ type Node struct {
 	identityStore  identity.Store
 	peerRegistry   PeerRegistry
 	ckd            *CKD
+
+	reshareInflightChecker ReshareInflightChecker
 }
 
 func NewNode(
@@ -76,6 +85,23 @@ func NewNode(
 
 func (p *Node) ID() string {
 	return p.nodeID
+}
+
+func (p *Node) SetReshareInflightChecker(fn ReshareInflightChecker) {
+	p.reshareInflightChecker = fn
+}
+
+func (p *Node) reshareInflight(walletID string) bool {
+	if p.reshareInflightChecker == nil {
+		return false
+	}
+	inflight, err := p.reshareInflightChecker(walletID)
+	if err != nil {
+		// Fail-open: a Consul outage must not block all signing.
+		logger.Warn("Reshare inflight check failed; allowing signing", "walletID", walletID, "error", err.Error())
+		return false
+	}
+	return inflight
 }
 
 // KeygenParty returns the committee (peer IDs including self) that will run the
@@ -170,6 +196,10 @@ func (p *Node) CreateSigningSession(
 	derivationPath []uint32,
 	idempotentKey string,
 ) (SigningSession, error) {
+	if p.reshareInflight(walletID) {
+		return nil, ErrReshareInProgress
+	}
+
 	version := p.getVersion(sessionType, walletID)
 	keyInfo, err := p.getKeyInfo(sessionType, walletID)
 	if err != nil {
