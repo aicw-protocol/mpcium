@@ -409,6 +409,7 @@ func handleSignSolanaMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sigB64 := base64.StdEncoding.EncodeToString(out.Signature)
+	postMpcRewardEvent(body.WalletID, "sign", txID)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"txId":         txID,
@@ -687,6 +688,8 @@ func handleExecuteWill(w http.ResponseWriter, r *http.Request) {
 			"success":     true,
 		})
 	}
+
+	postMpcRewardEvent(body.WalletID, "will_execute", "")
 
 	// 7. Return results
 	w.Header().Set("Content-Type", "application/json")
