@@ -409,7 +409,7 @@ func handleSignSolanaMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sigB64 := base64.StdEncoding.EncodeToString(out.Signature)
-	postMpcRewardEvent(body.WalletID, "sign", txID)
+	postMpcRewardEvent(body.WalletID, detectMpcRewardEventType(msgBytes), txID)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"txId":         txID,
@@ -575,6 +575,7 @@ func handleExecuteWill(w http.ResponseWriter, r *http.Request) {
 
 	// 6. Execute transfers one by one
 	var results []map[string]any
+	var willExecuteSig string
 	aiAgentPubkeyBytes, _ := base58.Decode(body.AIAgentPubkey)
 
 	for _, transfer := range transfers {
@@ -681,6 +682,9 @@ func handleExecuteWill(w http.ResponseWriter, r *http.Request) {
 		}
 
 		log.Printf("[execute-will] Transfer %d lamports to %s: %s", transfer.Amount, transfer.Pubkey, txSig)
+		if willExecuteSig == "" {
+			willExecuteSig = txSig
+		}
 		results = append(results, map[string]any{
 			"beneficiary": transfer.Pubkey,
 			"amount":      transfer.Amount,
@@ -689,7 +693,7 @@ func handleExecuteWill(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	postMpcRewardEvent(body.WalletID, "will_execute", "")
+	postMpcRewardEvent(body.WalletID, "will_execute", willExecuteSig)
 
 	// 7. Return results
 	w.Header().Set("Content-Type", "application/json")
