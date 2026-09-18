@@ -17,6 +17,9 @@ import (
 type MPCClient interface {
 	CreateWallet(walletID string) error
 	CreateWalletWithAuthorizers(walletID string, authorizerSignatures []types.AuthorizerSignature) error
+	// CreateWalletWithKeyTypes requests only the given key families (AICW-FORK).
+	// nil/empty falls back to the nodes' configured default.
+	CreateWalletWithKeyTypes(walletID string, keyTypes []types.KeyType, authorizerSignatures []types.AuthorizerSignature) error
 	OnWalletCreationResult(callback func(event event.KeygenResultEvent)) error
 
 	SignTransaction(msg *types.SignTxMessage) error
@@ -127,9 +130,24 @@ func (c *mpcClient) CreateWallet(walletID string) error {
 
 // CreateWalletWithAuthorizers generates a GenerateKeyMessage with authorizer signatures, signs it, and publishes it.
 func (c *mpcClient) CreateWalletWithAuthorizers(walletID string, authorizerSignatures []types.AuthorizerSignature) error {
+	return c.CreateWalletWithKeyTypes(walletID, nil, authorizerSignatures)
+}
+
+// CreateWalletWithKeyTypes builds a GenerateKeyMessage that pins the key
+// families to generate, signs it (the key types are part of the signed
+// payload) and publishes it.
+func (c *mpcClient) CreateWalletWithKeyTypes(walletID string, keyTypes []types.KeyType, authorizerSignatures []types.AuthorizerSignature) error {
+	if len(keyTypes) > 0 {
+		normalized, err := types.ParseKeyTypes(types.KeyTypeStrings(keyTypes))
+		if err != nil {
+			return fmt.Errorf("CreateWallet: %w", err)
+		}
+		keyTypes = normalized
+	}
 	// build the message
 	msg := &types.GenerateKeyMessage{
 		WalletID:             walletID,
+		KeyTypes:             keyTypes,
 		AuthorizerSignatures: authorizerSignatures,
 	}
 	// compute the canonical raw bytes

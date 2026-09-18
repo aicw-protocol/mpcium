@@ -49,8 +49,14 @@ type reshareResponse struct {
 	Results   []reshareKeyResult `json:"results"`
 }
 
-// manualReshareKeyTypes is the default ordered set (§4.4): EdDSA then ECDSA.
-var manualReshareKeyTypes = []types.KeyType{types.KeyTypeEd25519, types.KeyTypeSecp256k1}
+// manualReshareKeyTypes returns the default ordered set when the request omits
+// key_types. AICW-FORK: this follows the bridge's `keygen_key_types` (default
+// Ed25519 only) so a manual reshare does not attempt an ECDSA family that the
+// wallets were never created with (§4.4 order — EdDSA first — is preserved by
+// ParseKeyTypes keeping the configured order).
+func manualReshareKeyTypes() []types.KeyType {
+	return bridgeKeygenKeyTypes()
+}
 
 // internalAuthOK gates the internal endpoint (§5.1: mTLS / IP allowlist). We
 // support a bearer token (env MPC_BRIDGE_INTERNAL_TOKEN) and/or an IP allowlist
@@ -262,7 +268,7 @@ func publishAndWaitReshare(
 
 func parseReshareKeyTypes(in []string) ([]types.KeyType, error) {
 	if len(in) == 0 {
-		return manualReshareKeyTypes, nil
+		return manualReshareKeyTypes(), nil
 	}
 	out := make([]types.KeyType, 0, len(in))
 	for _, s := range in {

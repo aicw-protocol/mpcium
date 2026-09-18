@@ -17,14 +17,22 @@ import (
 )
 
 const (
-	// Maximum time to wait for a keygen response.
-	// Must be longer than KeyGenTimeOut in event_consumer.go (30s) so the
-	// event consumer always finishes first and sends a reply (success or error)
-	// before the keygen consumer gives up and NAKs.
-	keygenResponseTimeout = 45 * time.Second
+	// keygenResponseGrace is added on top of KeyGenTimeout() to form the
+	// maximum time to wait for a keygen reply. The reply wait must be longer
+	// than the ceremony budget so the event consumer always finishes first and
+	// sends a reply (success or error) before the keygen consumer gives up and
+	// NAKs. AICW-FORK: derived from the configurable KeyGenTimeout instead of a
+	// fixed 45s.
+	keygenResponseGrace = 15 * time.Second
 	// How often to poll for the reply message.
 	keygenPollingInterval = 500 * time.Millisecond
 )
+
+// keygenResponseTimeout returns how long the JetStream consumer waits for the
+// MPC reply before NAKing for redelivery.
+func keygenResponseTimeout() time.Duration {
+	return KeyGenTimeout() + keygenResponseGrace
+}
 
 // KeygenConsumer represents a consumer that processes signing events.
 type KeygenConsumer interface {
@@ -198,7 +206,7 @@ func (sc *keygenConsumer) handleKeygenEvent(msg jetstream.Msg) {
 	// the ack deadline so JetStream does not redeliver while we're still working.
 	// MaxAckPending on the consumer limits concurrency: JetStream won't deliver
 	// new messages until in-flight ones are ACKed, providing natural backpressure.
-	deadline := time.Now().Add(keygenResponseTimeout)
+	deadline := time.Now().Add(keygenResponseTimeout())
 	for time.Now().Before(deadline) {
 		replyMsg, err := replySub.NextMsg(keygenPollingInterval)
 		if err != nil {

@@ -228,11 +228,33 @@ func handleAIAgentPubkey(w http.ResponseWriter, r *http.Request) {
 	mpcCl := client.NewMPCClient(client.Options{NatsConn: nc, Signer: signer, ClientID: body.ClientID})
 	walletID := uuid.New().String()
 	resCh := make(chan event.KeygenResultEvent, 1)
-	if err := mpcCl.OnWalletCreationResult(func(e event.KeygenResultEvent) { resCh <- e }); err != nil {
+	// AICW-FORK: the result consumer is durable per clientId and shared across
+	// requests. A result that arrives after a previous request already returned
+	// (e.g. a node-side timeout that outlived the 90s budget) stays pending and
+	// is delivered to the NEXT request first. Without this filter the bridge
+	// answered in ~40ms with another wallet's result while the real keygen ran
+	// unobserved, producing the alternating 200/502 pattern. Only accept the
+	// result for the wallet this request created; stale ones are acked and
+	// dropped, which also drains the backlog.
+	if err := mpcCl.OnWalletCreationResult(func(e event.KeygenResultEvent) {
+		if e.WalletID != walletID {
+			log.Printf("[ai-agent-pubkey] ignoring stale keygen result: got wallet %s, want %s", e.WalletID, walletID)
+			return
+		}
+		select {
+		case resCh <- e:
+		default:
+		}
+	}); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
-	if err := mpcCl.CreateWallet(walletID); err != nil {
+	// AICW-FORK: the Bridge decides which key families every wallet gets
+	// (bridge config `keygen_key_types`, default Ed25519 only). The list is
+	// signed into the request, so enabling ECDSA later is a one-line change on
+	// this server — no coordinated config rollout across operator nodes.
+	keyTypes := bridgeKeygenKeyTypes()
+	if err := mpcCl.CreateWalletWithKeyTypes(walletID, keyTypes, nil); err != nil {
 		http.Error(w, err.Error(), 500)
 		return
 	}
@@ -278,12 +300,32 @@ func handleAIAgentPubkey(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b64 := base64.StdEncoding.EncodeToString(res.EDDSAPubKey)
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	out := map[string]any{
 		"walletId":      res.WalletID,
 		"eddsaPubKey":   b64,
 		"eddsa_pub_key": b64,
-	})
+	}
+	// Present only when the Bridge requested secp256k1 (EVM) as well.
+	if len(res.ECDSAPubKey) > 0 {
+		out["ecdsaPubKey"] = base64.StdEncoding.EncodeToString(res.ECDSAPubKey)
+		out["ecdsa_pub_key"] = out["ecdsaPubKey"]
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(out)
+}
+
+// bridgeKeygenKeyTypes returns the key families the Bridge requests for every
+// new wallet, from `keygen_key_types` in the bridge config (default Ed25519
+// only). Invalid config falls back to the default and is logged, so a typo
+// cannot take wallet creation down.
+func bridgeKeygenKeyTypes() []types.KeyType {
+	kts, err := types.ParseKeyTypes(viper.GetStringSlice(types.KeygenKeyTypesConfigKey))
+	if err != nil {
+		log.Printf("[ai-agent-pubkey] invalid %s in bridge config (%v); defaulting to %v",
+			types.KeygenKeyTypesConfigKey, err, types.DefaultKeygenKeyTypes)
+		return append([]types.KeyType(nil), types.DefaultKeygenKeyTypes...)
+	}
+	return kts
 }
 
 // Solana `MessageV0` 직렬화(bytes) + wallet_id → Mpcium 임계 서명.

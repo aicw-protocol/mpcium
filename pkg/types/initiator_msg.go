@@ -1,6 +1,9 @@
 package types
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strings"
+)
 
 type KeyType string
 
@@ -35,7 +38,12 @@ type InitiatorMessage interface {
 }
 
 type GenerateKeyMessage struct {
-	WalletID             string                `json:"wallet_id"`
+	WalletID string `json:"wallet_id"`
+	// KeyTypes lists the key families to generate for this wallet.
+	// AICW-FORK: the initiator (Bridge) decides per request, so a network of
+	// independently operated nodes needs no coordinated config change to turn a
+	// family on or off. Empty means "node default" (see KeygenKeyTypesConfigKey).
+	KeyTypes             []KeyType             `json:"key_types,omitempty"`
 	Signature            []byte                `json:"signature"`
 	AuthorizerSignatures []AuthorizerSignature `json:"authorizer_signatures,omitempty"`
 }
@@ -88,7 +96,14 @@ func (m *SignTxMessage) InitiatorID() string {
 }
 
 func (m *GenerateKeyMessage) Raw() ([]byte, error) {
-	return []byte(m.WalletID), nil
+	// Legacy payload (wallet id only) is kept byte-identical when no key types
+	// are requested, so signatures from older initiators still verify. When key
+	// types are present they are bound into the signed payload so a relay cannot
+	// strip or add a family without invalidating the initiator signature.
+	if len(m.KeyTypes) == 0 {
+		return []byte(m.WalletID), nil
+	}
+	return []byte(m.WalletID + "|key_types=" + strings.Join(KeyTypeStrings(m.KeyTypes), ",")), nil
 }
 
 func (m *GenerateKeyMessage) Sig() []byte {

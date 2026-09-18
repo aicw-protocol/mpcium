@@ -28,7 +28,14 @@ const (
 
 	DefaultConcurrentKeygen  = 2
 	DefaultConcurrentSigning = 20
-	KeyGenTimeOut            = 30 * time.Second
+	// DefaultKeyGenTimeOut bounds one keygen ceremony (ECDH gate + peer barrier
+	// + ECDSA/EdDSA TSS rounds) when `keygen_timeout_seconds` is not configured.
+	// AICW-FORK: raised from 30s — with 5-node committees on operator PCs the
+	// two parallel keygens routinely exceeded 30s and surfaced as a Bridge 502.
+	DefaultKeyGenTimeOut = 60 * time.Second
+	// KeygenTimeoutConfigKey is the viper key (network-config / operator-config)
+	// that overrides DefaultKeyGenTimeOut, in seconds.
+	KeygenTimeoutConfigKey = "keygen_timeout_seconds"
 	// ReshareCeremonyTimeOut bounds the TSS rounds after the readiness barrier.
 	// tss-lib blocks indefinitely when a party stops sending, so without this the
 	// handler would hold the wallet's reshare slot for the lifetime of the process
@@ -36,6 +43,63 @@ const (
 	// below the orchestrator's result timeout so it sees a failure and can retry.
 	ReshareCeremonyTimeOut = 120 * time.Second
 )
+
+// KeyGenTimeout returns the configured keygen ceremony budget. It must stay
+// below the keygen consumer's reply wait (see keygenResponseTimeout) and the
+// Bridge's 90s request timeout, otherwise callers see a generic timeout instead
+// of the node-reported error.
+func KeyGenTimeout() time.Duration {
+	if secs := viper.GetInt(KeygenTimeoutConfigKey); secs > 0 {
+		return time.Duration(secs) * time.Second
+	}
+	return DefaultKeyGenTimeOut
+}
+
+// KeygenKeyTypes returns the key families this node generates per keygen
+// request, from `keygen_key_types` (default: Ed25519 only). Every node in the
+// cluster must agree on this list — a node that creates an ECDSA session while
+// its committee peers do not would stall on the peer barrier.
+func KeygenKeyTypes() ([]types.KeyType, error) {
+	return types.ParseKeyTypes(viper.GetStringSlice(types.KeygenKeyTypesConfigKey))
+}
+
+// keygenSessionTypesFor maps configured key families to MPC session types.
+func keygenSessionTypesFor(kts []types.KeyType) []mpc.SessionType {
+	out := make([]mpc.SessionType, 0, len(kts))
+	for _, kt := range kts {
+		switch kt {
+		case types.KeyTypeSecp256k1:
+			out = append(out, mpc.SessionTypeECDSA)
+		case types.KeyTypeEd25519:
+			out = append(out, mpc.SessionTypeEDDSA)
+		}
+	}
+	return out
+}
+
+// resolveKeygenSessionTypes returns the sessions to run for a keygen request:
+// the request's key_types when present (validated), else the node default.
+func (ec *eventConsumer) resolveKeygenSessionTypes(requested []types.KeyType) ([]mpc.SessionType, error) {
+	if len(requested) == 0 {
+		return ec.keygenSessionTypes, nil
+	}
+	kts, err := types.ParseKeyTypes(types.KeyTypeStrings(requested))
+	if err != nil {
+		return nil, err
+	}
+	return keygenSessionTypesFor(kts), nil
+}
+
+func keygenSessionLabel(st mpc.SessionType) string {
+	switch st {
+	case mpc.SessionTypeECDSA:
+		return "ECDSA"
+	case mpc.SessionTypeEDDSA:
+		return "EdDSA"
+	default:
+		return string(st)
+	}
+}
 
 type EventConsumer interface {
 	Run()
@@ -60,6 +124,9 @@ type eventConsumer struct {
 	signingMsgBuffer     chan *nats.Msg
 	maxConcurrentKeygen  int
 	maxConcurrentSigning int
+	// keygenSessionTypes are the MPC sessions one keygen request spawns
+	// (AICW-FORK: from `keygen_key_types`, default EdDSA only).
+	keygenSessionTypes []mpc.SessionType
 	// Track active sessions with timestamps for cleanup
 	activeSessions  map[string]time.Time // Maps "walletID-txID" to creation time
 	sessionsLock    sync.RWMutex
@@ -86,15 +153,25 @@ func NewEventConsumer(
 		maxConcurrentSigning = DefaultConcurrentSigning
 	}
 
+	keygenKeyTypes, err := KeygenKeyTypes()
+	if err != nil {
+		logger.Fatal("Invalid keygen key type configuration", err)
+	}
+
 	logger.Info(
 		"Initializing event consumer",
 		"max_concurrent_keygen",
 		maxConcurrentKeygen,
 		"max_concurrent_signing",
 		maxConcurrentSigning,
+		"keygen_key_types",
+		keygenKeyTypes,
+		"keygen_timeout",
+		KeyGenTimeout(),
 	)
 
 	ec := &eventConsumer{
+		keygenSessionTypes:   keygenSessionTypesFor(keygenKeyTypes),
 		node:                 node,
 		pubsub:               pubsub,
 		genKeyResultQueue:    genKeyResultQueue,
@@ -149,7 +226,8 @@ func (ec *eventConsumer) handleKeyGenEvent(natMsg *nats.Msg) {
 		return
 	}
 
-	baseCtx, baseCancel := context.WithTimeout(context.Background(), KeyGenTimeOut)
+	keygenTimeout := KeyGenTimeout()
+	baseCtx, baseCancel := context.WithTimeout(context.Background(), keygenTimeout)
 	defer baseCancel()
 
 	raw := natMsg.Data
@@ -196,78 +274,91 @@ func (ec *eventConsumer) handleKeyGenEvent(natMsg *nats.Msg) {
 	}
 	defer ec.removeSession(walletID, "keygen")
 
-	ecdsaSession, err := ec.node.CreateKeyGenSession(mpc.SessionTypeECDSA, walletID, ec.mpcThreshold, ec.genKeyResultQueue)
+	// AICW-FORK: the initiator picks the key families per request (signed into
+	// the message, so every committee member derives the same session set); an
+	// empty list falls back to this node's `keygen_key_types` default (Ed25519
+	// only). Each family runs its own session; they share the ceremony budget
+	// and the peer barrier below.
+	sessionTypes, err := ec.resolveKeygenSessionTypes(msg.KeyTypes)
 	if err != nil {
-		ec.handleKeygenSessionError(walletID, err, "Failed to create ECDSA key generation session", natMsg)
+		ec.handleKeygenSessionError(walletID, err, "Invalid key types in keygen request", natMsg)
 		return
 	}
-	eddsaSession, err := ec.node.CreateKeyGenSession(mpc.SessionTypeEDDSA, walletID, ec.mpcThreshold, ec.genKeyResultQueue)
-	if err != nil {
-		ec.handleKeygenSessionError(walletID, err, "Failed to create EdDSA key generation session", natMsg)
-		return
-	}
-	ecdsaSession.Init()
-	eddsaSession.Init()
+	logger.Info("Keygen key families", "walletID", walletID, "key_types", msg.KeyTypes, "sessions", len(sessionTypes))
 
-	ctxEcdsa, doneEcdsa := context.WithCancel(baseCtx)
-	ctxEddsa, doneEddsa := context.WithCancel(baseCtx)
+	type keygenRun struct {
+		sessionType mpc.SessionType
+		label       string
+		session     mpc.KeyGenSession
+		done        func()
+		ctx         context.Context
+	}
+	runs := make([]*keygenRun, 0, len(sessionTypes))
+	for _, st := range sessionTypes {
+		label := keygenSessionLabel(st)
+		session, err := ec.node.CreateKeyGenSession(st, walletID, ec.mpcThreshold, ec.genKeyResultQueue)
+		if err != nil {
+			ec.handleKeygenSessionError(walletID, err, fmt.Sprintf("Failed to create %s key generation session", label), natMsg)
+			return
+		}
+		session.Init()
+		ctx, done := context.WithCancel(baseCtx)
+		runs = append(runs, &keygenRun{sessionType: st, label: label, session: session, done: done, ctx: ctx})
+	}
 
 	successEvent := &event.KeygenResultEvent{WalletID: walletID, ResultType: event.ResultTypeSuccess}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(len(runs))
 
 	// Channel to communicate errors from goroutines to main function
-	errorChan := make(chan error, 2)
+	errorChan := make(chan error, len(runs))
 
-	go func() {
-		defer wg.Done()
-		select {
-		case <-ctxEcdsa.Done():
-			successEvent.ECDSAPubKey = ecdsaSession.GetPubKeyResult()
-		case err := <-ecdsaSession.ErrChan():
-			logger.Error("ECDSA keygen session error", err)
-			ec.handleKeygenSessionError(walletID, err, "ECDSA keygen session error", natMsg)
-			errorChan <- err
-			doneEcdsa()
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		select {
-		case <-ctxEddsa.Done():
-			successEvent.EDDSAPubKey = eddsaSession.GetPubKeyResult()
-		case err := <-eddsaSession.ErrChan():
-			logger.Error("EdDSA keygen session error", err)
-			ec.handleKeygenSessionError(walletID, err, "EdDSA keygen session error", natMsg)
-			errorChan <- err
-			doneEddsa()
-		}
-	}()
+	for _, run := range runs {
+		go func(run *keygenRun) {
+			defer wg.Done()
+			select {
+			case <-run.ctx.Done():
+				switch run.sessionType {
+				case mpc.SessionTypeECDSA:
+					successEvent.ECDSAPubKey = run.session.GetPubKeyResult()
+				case mpc.SessionTypeEDDSA:
+					successEvent.EDDSAPubKey = run.session.GetPubKeyResult()
+				}
+			case err := <-run.session.ErrChan():
+				logger.Error(run.label+" keygen session error", err)
+				ec.handleKeygenSessionError(walletID, err, run.label+" keygen session error", natMsg)
+				errorChan <- err
+				run.done()
+			}
+		}(run)
+	}
 
-	ecdsaSession.ListenToIncomingMessageAsync()
-	eddsaSession.ListenToIncomingMessageAsync()
+	for _, run := range runs {
+		run.session.ListenToIncomingMessageAsync()
+	}
 
 	// Verify all peers have their subscriptions active before starting.
-	// Run both barriers in parallel since they use independent topics.
+	// Run the barriers in parallel since they use independent topics.
+	var barrierMu sync.Mutex
 	var barrierErr error
 	var barrierWg sync.WaitGroup
-	barrierWg.Go(func() {
-		if err := ecdsaSession.WaitForPeersReady(); err != nil {
-			barrierErr = fmt.Errorf("ECDSA: %w", err)
-		}
-	})
-	barrierWg.Go(func() {
-		if err := eddsaSession.WaitForPeersReady(); err != nil {
-			barrierErr = fmt.Errorf("EDDSA: %w", err)
-		}
-	})
+	for _, run := range runs {
+		barrierWg.Go(func() {
+			if err := run.session.WaitForPeersReady(); err != nil {
+				barrierMu.Lock()
+				barrierErr = fmt.Errorf("%s: %w", run.label, err)
+				barrierMu.Unlock()
+			}
+		})
+	}
 	barrierWg.Wait()
 	if barrierErr != nil {
 		ec.handleKeygenSessionError(walletID, barrierErr, "Peers not ready before keygen", natMsg)
 		return
 	}
-	go ecdsaSession.GenerateKey(doneEcdsa)
-	go eddsaSession.GenerateKey(doneEddsa)
+	for _, run := range runs {
+		go run.session.GenerateKey(run.done)
+	}
 
 	// Wait for completion or timeout
 	doneAll := make(chan struct{})
@@ -288,8 +379,8 @@ func (ec *eventConsumer) handleKeyGenEvent(natMsg *nats.Msg) {
 		}
 	case <-baseCtx.Done():
 		// timeout occurred
-		logger.Warn("Key generation timed out", "walletID", walletID, "timeout", KeyGenTimeOut)
-		ec.handleKeygenSessionError(walletID, fmt.Errorf("keygen session timed out after %v", KeyGenTimeOut), "Key generation timed out", natMsg)
+		logger.Warn("Key generation timed out", "walletID", walletID, "timeout", keygenTimeout)
+		ec.handleKeygenSessionError(walletID, fmt.Errorf("keygen session timed out after %v", keygenTimeout), "Key generation timed out", natMsg)
 		return
 	}
 
